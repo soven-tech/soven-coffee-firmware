@@ -15,20 +15,24 @@ String broadcastName = "";
 #define RELAY_PIN 10        // Relay control
 #define LED_DATA_PIN 4      // WS2812B data line
 #define TEMP_SENSOR_PIN 7   // Thermistor ADC input
-#define NUM_LEDS 5          // 5 LEDs in strip
+#define NUM_LEDS 3          // 3 LEDs in strip
 
 // Temperature thresholds
 #define EMPTY_RESERVOIR_TEMP 115.0  // °C - temp spike when dry
 #define NORMAL_BREW_TEMP 100.0      // °C - normal boiling temp
 
 // Global LED state array
-bool ledStates[5] = {false, false, false, false, false};
+bool ledStates[3] = {false, false, false};
+
+// Hybrid LED control
+bool appControlsLeds = false;
+unsigned long lastAppLedUpdate = 0;
+const unsigned long APP_LED_TIMEOUT = 5000; // 5 seconds - firmware takes back control after this
 
 // BLE UUIDs
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define STATE_CHAR_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define TEMP_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a9"
-//#define PROGRESS_CHAR_UUID  "beb5483e-36e1-4688-b7f5-ea07361b26aa"
 #define COMMAND_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26ab"
 #define CONVO_CHAR_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26ac"
 #define LED_STATE_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26ad"
@@ -67,7 +71,6 @@ const unsigned long KEEP_WARM_DURATION = 1800000;  // 30 minutes
 BLEServer* pServer = NULL;
 BLECharacteristic* pStateChar = NULL;
 BLECharacteristic* pTempChar = NULL;
-//BLECharacteristic* pProgressChar = NULL;
 BLECharacteristic* pCommandChar = NULL;
 BLECharacteristic* pConvoChar = NULL;
 bool deviceConnected = false;
@@ -132,7 +135,7 @@ void broadcastLedState() {
     uint8_t ledStates = 0;
     for (int i = 0; i < NUM_LEDS; i++) {
         RgbwColor color = strip.GetPixelColor(i);
-        if (color.R > 50 || color.G > 50) { // LED is "on" (yellow)
+        if (color.B > 50) { // LED is "on" (blue)
             ledStates |= (1 << i);
         }
     }
@@ -141,6 +144,18 @@ void broadcastLedState() {
 }
 
 void updateLEDs() {
+    // Check if app has timed out - take back control
+    if (appControlsLeds && (millis() - lastAppLedUpdate > APP_LED_TIMEOUT)) {
+        appControlsLeds = false;
+        Serial.println(">>> FIRMWARE CONTROL: App timeout - firmware taking back LED control");
+    }
+    
+    // If app controls LEDs, don't interfere
+    if (appControlsLeds) {
+        return;
+    }
+    
+    // Firmware controls LEDs from here on...
     // Critical: Clear and latch FIRST
     strip.ClearTo(RgbwColor(0, 0, 0, 0));
     strip.Show();
@@ -317,14 +332,7 @@ void updateStateMachine() {
                 Serial.println("\nBrew timer complete");
                 transitionToState(KEEPING_WARM);
             }
-            
-            // Update progress
-            //if (pProgressChar && deviceConnected) {
-            //    uint8_t progress = getBrewProgress();
-            //    pProgressChar->setValue(&progress, 1);
-            //    pProgressChar->notify();
-            //}
-            
+
             // Update temperature characteristic
             if (pTempChar && deviceConnected) {
                 pTempChar->setValue(heatingElementTemp);
@@ -374,13 +382,15 @@ void handleCommand(const char* command) {
 class ServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
-        connState = CONNECTED;
+        // Don't change connState here - let the connection stay in firmware control
+        // App will take LED control explicitly when it wants to show connection animation
         Serial.println("Device connected");
     }
 
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
         connState = DISCONNECTED;
+        appControlsLeds = false; // Release app control on disconnect
         Serial.println("Device disconnected");
         BLEDevice::startAdvertising();
     }
@@ -432,14 +442,27 @@ class LedStateCallbacks: public BLECharacteristicCallbacks {
             
             Serial.print(">>> Received LED byte: ");
             Serial.println(ledByte);
+            
+            // App takes control of LEDs
+            appControlsLeds = true;
+            lastAppLedUpdate = millis();
+            Serial.println(">>> APP CONTROL: App now controls LEDs");
 
-            // Update LED states from bits
-            for (int i = 0; i < 5; i++) {
+            // Update LED states from bits AND physically light them
+            strip.ClearTo(RgbwColor(0, 0, 0, 0));
+            
+            for (int i = 0; i < NUM_LEDS; i++) {
                 ledStates[i] = (ledByte & (1 << i)) != 0;
+                
+                if (ledStates[i]) {
+                    strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0));
+                }
             }
             
-            Serial.print(">>> LED state updated: ");
-            for (int i = 0; i < 5; i++) {
+            strip.Show();
+            
+            Serial.print(">>> LED state updated and displayed: ");
+            for (int i = 0; i < NUM_LEDS; i++) {
                 Serial.print(ledStates[i] ? "1" : "0");
             }
             Serial.println();
@@ -510,13 +533,7 @@ void setup() {
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
     );
     pTempChar->addDescriptor(new BLE2902());
-    
-    //pProgressChar = pService->createCharacteristic(
-    //    PROGRESS_CHAR_UUID,
-    //    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-    //);
-    //pProgressChar->addDescriptor(new BLE2902());
-    
+       
     pCommandChar = pService->createCharacteristic(
         COMMAND_CHAR_UUID,
         BLECharacteristic::PROPERTY_WRITE
