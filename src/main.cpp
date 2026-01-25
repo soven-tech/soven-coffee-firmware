@@ -1,45 +1,40 @@
-// Soven Coffee Maker Firmware - MVP1 with NeoPixelBus RGBW
+// Soven HUB Firmware
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <NeoPixelBus.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
+#include "SovenProtocol.h"
+#include "DeviceRegistry.h"
 
 Preferences preferences;
 String deviceSerial = "";
 String broadcastName = "";
 
 // Pin definitions
-#define RELAY_PIN 10        // Relay control
-#define LED_DATA_PIN 4      // WS2812B data line
-#define TEMP_SENSOR_PIN 7   // Thermistor ADC input
-#define NUM_LEDS 3          // 3 LEDs in strip
+#define RELAY_PIN 10
+#define LED_DATA_PIN 4
+#define TEMP_SENSOR_PIN 7
+#define NUM_LEDS 3
 
 // Temperature thresholds
-#define EMPTY_RESERVOIR_TEMP 115.0  // °C - temp spike when dry
-#define NORMAL_BREW_TEMP 100.0      // °C - normal boiling temp
+#define EMPTY_RESERVOIR_TEMP 115.0
+#define NORMAL_BREW_TEMP 100.0
 
-// Global LED state array
+// Global LED state
 bool ledStates[3] = {false, false, false};
-
-// Hybrid LED control
 bool appControlsLeds = false;
 unsigned long lastAppLedUpdate = 0;
-const unsigned long APP_LED_TIMEOUT = 5000; // 5 seconds - firmware takes back control after this
+const unsigned long APP_LED_TIMEOUT = 5000;
 
-// BLE UUIDs
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define STATE_CHAR_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define TEMP_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a9"
-#define COMMAND_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26ab"
-#define CONVO_CHAR_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26ac"
-#define LED_STATE_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26ad"
+// Device registry for mesh
+DeviceRegistry registry;
+NimBLEScan* pBLEScan = nullptr;
+unsigned long lastDeviceScan = 0;
+const unsigned long DEVICE_SCAN_INTERVAL = 10000;
+bool isScanning = false;
 
-BLECharacteristic* pLedStateChar = NULL;
-
-// NeoPixelBus - RGBW with S3-optimized RMT driver
+// NeoPixelBus
 NeoPixelBus<NeoGrbwFeature, NeoEsp32Rmt0800KbpsMethod> strip(NUM_LEDS, LED_DATA_PIN);
 
 // State machine
@@ -56,7 +51,6 @@ enum ConnectionState {
     CONNECTED
 };
 
-// Global state
 BrewState currentState = IDLE;
 ConnectionState connState = DISCONNECTED;
 float heatingElementTemp = 25.0;
@@ -65,30 +59,33 @@ unsigned long stateStartTime = 0;
 unsigned long keepWarmStartTime = 0;
 bool heatingElementOn = false;
 uint8_t ledBrightness = 100;
-const unsigned long KEEP_WARM_DURATION = 1800000;  // 30 minutes
+const unsigned long KEEP_WARM_DURATION = 1800000;
 
-// BLE objects
-BLEServer* pServer = NULL;
-BLECharacteristic* pStateChar = NULL;
-BLECharacteristic* pTempChar = NULL;
-BLECharacteristic* pCommandChar = NULL;
-BLECharacteristic* pConvoChar = NULL;
+// NimBLE objects
+NimBLEServer* pServer = NULL;
+NimBLECharacteristic* pCommandChar = NULL;
+NimBLECharacteristic* pStatusChar = NULL;
+NimBLECharacteristic* pBrewStateChar = NULL;
+NimBLECharacteristic* pTempChar = NULL;
+NimBLECharacteristic* pLedControlChar = NULL;
+NimBLECharacteristic* pConvoChar = NULL;
 bool deviceConnected = false;
 
-// Thermistor constants for 10K NTC @ 25°C, B=3950
+// Thermistor constants
 const float SERIES_RESISTOR = 10000.0;
 const float THERMISTOR_NOMINAL = 10000.0;
 const float TEMPERATURE_NOMINAL = 25.0;
 const float B_COEFFICIENT = 3950.0;
 
+// ============================================================================
+// TEMPERATURE SENSING
+// ============================================================================
+
 float readTemperature() {
     int rawADC = analogRead(TEMP_SENSOR_PIN);
-    
     if (rawADC == 0) return -999;
     
     float resistance = SERIES_RESISTOR / ((4095.0 / rawADC) - 1.0);
-    
-    // Steinhart-Hart equation
     float steinhart = resistance / THERMISTOR_NOMINAL;
     steinhart = log(steinhart);
     steinhart /= B_COEFFICIENT;
@@ -99,9 +96,12 @@ float readTemperature() {
     return steinhart;
 }
 
+// ============================================================================
+// RELAY CONTROL
+// ============================================================================
+
 void setHeatingElement(bool state) {
     static bool lastState = false;
-    
     if (state != lastState) {
         heatingElementOn = state;
         digitalWrite(RELAY_PIN, state ? HIGH : LOW);
@@ -113,15 +113,10 @@ void setHeatingElement(bool state) {
     }
 }
 
-uint8_t getBrewProgress() {
-    if (currentState != BREWING) return 0;
-    
-    unsigned long elapsed = millis() - brewStartTime;
-    uint8_t progress = (elapsed * 100) / 480000;  // 8 minutes
-    return min(progress, (uint8_t)100);
-}
+// ============================================================================
+// LED CONTROL
+// ============================================================================
 
-// Pulsing effect using simple sine approximation
 uint8_t getPulseValue(uint8_t bpm, uint8_t minVal, uint8_t maxVal) {
     float beats = (millis() / 1000.0) * (bpm / 60.0);
     float sinVal = sin(beats * 2.0 * PI);
@@ -130,38 +125,31 @@ uint8_t getPulseValue(uint8_t bpm, uint8_t minVal, uint8_t maxVal) {
 }
 
 void broadcastLedState() {
-    if (!deviceConnected) return;
+    if (!deviceConnected || !pLedControlChar) return;
     
-    uint8_t ledStates = 0;
+    uint8_t ledStateByte = 0;
     for (int i = 0; i < NUM_LEDS; i++) {
         RgbwColor color = strip.GetPixelColor(i);
-        if (color.B > 50) { // LED is "on" (blue)
-            ledStates |= (1 << i);
+        if (color.B > 50) {
+            ledStateByte |= (1 << i);
         }
     }
-    pLedStateChar->setValue(&ledStates, 1);
-    pLedStateChar->notify();
+    pLedControlChar->setValue(&ledStateByte, 1);
+    pLedControlChar->notify();
 }
 
 void updateLEDs() {
-    // Check if app has timed out - take back control
     if (appControlsLeds && (millis() - lastAppLedUpdate > APP_LED_TIMEOUT)) {
         appControlsLeds = false;
-        Serial.println(">>> FIRMWARE CONTROL: App timeout - firmware taking back LED control");
+        Serial.println(">>> Firmware taking back LED control");
     }
     
-    // If app controls LEDs, don't interfere
-    if (appControlsLeds) {
-        return;
-    }
+    if (appControlsLeds) return;
     
-    // Firmware controls LEDs from here on...
-    // Critical: Clear and latch FIRST
     strip.ClearTo(RgbwColor(0, 0, 0, 0));
     strip.Show();
     delayMicroseconds(500);
     
-    // CONNECTING animation - sequential dots
     if (connState == CONNECTING) {
         static uint8_t connectPos = 0;
         static unsigned long lastConnectMove = 0;
@@ -171,50 +159,40 @@ void updateLEDs() {
             connectPos = (connectPos + 1) % NUM_LEDS;
             lastConnectMove = millis();
             
-            // After 2 full cycles (10 steps), switch to CONNECTED
             if (connectPos == 0) {
                 connectCycles++;
                 if (connectCycles >= 2) {
                     connState = CONNECTED;
                     connectCycles = 0;
-                    Serial.println("Connection animation complete");
                 }
             }
         }
         
-        // Light only current position (electric blue)
         for(int i = 0; i < NUM_LEDS; i++) {
             if (i == connectPos) {
-                strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0)); // Bright blue
+                strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0));
             }
         }
-        
         strip.Show();
         broadcastLedState();
         return;
     }
     
-    // CONNECTED - all bright for 2 seconds, then enter IDLE
     if (connState == CONNECTED) {
         static unsigned long connectedStartTime = 0;
         
-        // Record start time on first entry
         if (connectedStartTime == 0) {
             connectedStartTime = millis();
-            Serial.println("All LEDs bright - waiting 2 seconds");
         }
         
         if (millis() - connectedStartTime < 2000) {
-            // All bright blue for 2 seconds
             for(int i = 0; i < NUM_LEDS; i++) {
                 strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0));
             }
         } else {
-            // Switch to IDLE state
-            Serial.println("Entering IDLE mode");
             currentState = IDLE;
             connState = DISCONNECTED;
-            connectedStartTime = 0; // Reset for next connection
+            connectedStartTime = 0;
         }
         
         strip.Show();
@@ -222,13 +200,12 @@ void updateLEDs() {
         return;
     }
 
-    // Normal state machine (IDLE, BREWING, etc)
     switch(currentState) {
         case IDLE:
             {
                 uint8_t brightness = getPulseValue(20, 30, ledBrightness);
                 for(int i = 0; i < NUM_LEDS; i++) {
-                    strip.SetPixelColor(i, RgbwColor(0, brightness, brightness*2, 0)); // Blue
+                    strip.SetPixelColor(i, RgbwColor(0, brightness, brightness*2, 0));
                 }
             }
             break;
@@ -248,8 +225,6 @@ void updateLEDs() {
                         strip.SetPixelColor(i, RgbwColor(0, ledBrightness/2, ledBrightness, 0));
                     } else if(i == ((pos + NUM_LEDS - 1) % NUM_LEDS)) {
                         strip.SetPixelColor(i, RgbwColor(0, ledBrightness/6, ledBrightness/3, 0));
-                    } else {
-                        strip.SetPixelColor(i, RgbwColor(0, 0, 0, 0));
                     }
                 }
             }
@@ -278,6 +253,10 @@ void updateLEDs() {
     broadcastLedState();
 }
 
+// ============================================================================
+// STATE MACHINE
+// ============================================================================
+
 const char* stateToString(BrewState state) {
     switch(state) {
         case IDLE: return "idle";
@@ -291,9 +270,7 @@ const char* stateToString(BrewState state) {
 void transitionToState(BrewState newState) {
     if (newState == currentState) return;
     
-    Serial.printf("\nState transition: %s -> %s\n", 
-                  stateToString(currentState), 
-                  stateToString(newState));
+    Serial.printf("\nState: %s -> %s\n", stateToString(currentState), stateToString(newState));
     
     currentState = newState;
     stateStartTime = millis();
@@ -302,9 +279,9 @@ void transitionToState(BrewState newState) {
         keepWarmStartTime = millis();
     }
     
-    if (pStateChar && deviceConnected) {
-        pStateChar->setValue(stateToString(currentState));
-        pStateChar->notify();
+    if (pBrewStateChar && deviceConnected) {
+        pBrewStateChar->setValue(stateToString(currentState));
+        pBrewStateChar->notify();
     }
 }
 
@@ -316,24 +293,19 @@ void updateStateMachine() {
             
         case BREWING:
             setHeatingElement(true);
-            
             heatingElementTemp = readTemperature();
-            Serial.printf("\rTemp: %.1f°C  ", heatingElementTemp);
             
-            // Check for empty reservoir (temp spike)
             if (heatingElementTemp > EMPTY_RESERVOIR_TEMP) {
                 Serial.println("\nReservoir empty!");
                 transitionToState(KEEPING_WARM);
                 break;
             }
             
-            // Backup timeout (8 min max)
             if (millis() - brewStartTime >= 480000) {
-                Serial.println("\nBrew timer complete");
+                Serial.println("\nBrew complete");
                 transitionToState(KEEPING_WARM);
             }
 
-            // Update temperature characteristic
             if (pTempChar && deviceConnected) {
                 pTempChar->setValue(heatingElementTemp);
                 pTempChar->notify();
@@ -343,9 +315,8 @@ void updateStateMachine() {
         case KEEPING_WARM:
             setHeatingElement(true);
             
-            // Auto-shutoff after 30 minutes
             if (millis() - keepWarmStartTime >= KEEP_WARM_DURATION) {
-                Serial.println("\nKeep-warm timeout, shutting off");
+                Serial.println("\nKeep-warm timeout");
                 transitionToState(IDLE);
             }
             break;
@@ -358,238 +329,323 @@ void updateStateMachine() {
     updateLEDs();
 }
 
-void handleCommand(const char* command) {
-    String cmd = String(command);
-    Serial.printf("Received command: %s\n", command);
-    
-    if (cmd == "start_brew") {
-        if (currentState == IDLE) {
-            brewStartTime = millis();
-            transitionToState(BREWING);
-        }
-    } 
-    else if (cmd == "stop_brew") {
-        transitionToState(IDLE);
-    }
-    else if (cmd == "keep_warm_off") {
-        if (currentState == KEEPING_WARM) {
-            transitionToState(IDLE);
-        }
-    }
+// ============================================================================
+// DEVICE CONTROL (Mesh)
+// ============================================================================
+
+bool turnOnDevice(String deviceName, String duration = "") {
+    return registry.sendCommand(deviceName, "power_on", duration);
 }
 
-// BLE Callbacks
-class ServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+bool turnOffDevice(String deviceName) {
+    return registry.sendCommand(deviceName, "power_off", "");
+}
+
+String getDeviceBattery(String deviceName) {
+    String status = registry.getDeviceStatus(deviceName);
+    StaticJsonDocument<768> doc;
+    deserializeJson(doc, status);
+    
+    if (doc.containsKey("error")) return "unknown";
+    return String((int)doc["battery"]["percentage"]);
+}
+
+void listDevices() {
+    registry.printRegistry();
+}
+
+// ============================================================================
+// NIMBLE CALLBACKS
+// ============================================================================
+
+class ServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
         deviceConnected = true;
-        // Don't change connState here - let the connection stay in firmware control
-        // App will take LED control explicitly when it wants to show connection animation
         Serial.println("Device connected");
     }
 
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(NimBLEServer* pServer) {
         deviceConnected = false;
         connState = DISCONNECTED;
-        appControlsLeds = false; // Release app control on disconnect
+        appControlsLeds = false;
         Serial.println("Device disconnected");
-        BLEDevice::startAdvertising();
+        NimBLEDevice::startAdvertising();
     }
 };
 
-class CommandCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-    std::string value = pCharacteristic->getValue();
-    
-        if (value.length() > 0) {
-            String command = String(value.c_str());
-            Serial.print("Received command: ");
-            Serial.println(command);
-            
-            if (command.startsWith("start_brew")) {
-                currentState = BREWING;
-                Serial.println("Starting brew");
-            }
-            else if (command.startsWith("stop_brew")) {
-                currentState = IDLE;
-                Serial.println("Stopping brew");
-            }
-            else if (command.startsWith("set_name:")) {
-                // Extract name after "set_name:"
-                String newName = command.substring(9);
-                Serial.print("Setting device name to: ");
-                Serial.println(newName);
-                
-                // Save to EEPROM
-                preferences.begin("soven", false);
-                preferences.putString("ai_name", newName);
-                preferences.end();
-                
-                Serial.println("Name saved! Restarting to apply...");
-                delay(500);
-                ESP.restart(); // Auto-restart to apply new name
+class CommandCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() == 0) return;
+        
+        String command = String(value.c_str());
+        Serial.println("Command: " + command);
+        
+        if (command == "start_brew") {
+            brewStartTime = millis();
+            transitionToState(BREWING);
+        }
+        else if (command == "stop_brew") {
+            transitionToState(IDLE);
+        }
+        else if (command == "keep_warm_off") {
+            if (currentState == KEEPING_WARM) {
+                transitionToState(IDLE);
             }
         }
-    }
-};
-
-class LedStateCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        Serial.println(">>> LED STATE CALLBACK TRIGGERED");
-        std::string value = pCharacteristic->getValue();
-        
-        if (value.length() > 0) {
-            uint8_t ledByte = value[0];
-            
-            Serial.print(">>> Received LED byte: ");
-            Serial.println(ledByte);
-            
-            // App takes control of LEDs
-            appControlsLeds = true;
-            lastAppLedUpdate = millis();
-            Serial.println(">>> APP CONTROL: App now controls LEDs");
-
-            // Update LED states from bits AND physically light them
-            strip.ClearTo(RgbwColor(0, 0, 0, 0));
-            
-            for (int i = 0; i < NUM_LEDS; i++) {
-                ledStates[i] = (ledByte & (1 << i)) != 0;
-                
-                if (ledStates[i]) {
-                    strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0));
+        else if (command.startsWith("set_name:")) {
+            String newName = command.substring(9);
+            preferences.begin("soven", false);
+            preferences.putString("ai_name", newName);
+            preferences.end();
+            Serial.println("Name saved, restarting...");
+            delay(500);
+            ESP.restart();
+        }
+        else if (command.startsWith("froth_on")) {
+            String duration = "30";
+            if (command.indexOf(':') > 0) {
+                duration = command.substring(command.indexOf(':') + 1);
+            }
+            if (turnOnDevice("frother", duration)) {
+                if (pStatusChar) {
+                    pStatusChar->setValue("Frothing milk");
+                    pStatusChar->notify();
                 }
             }
-            
-            strip.Show();
-            
-            Serial.print(">>> LED state updated and displayed: ");
-            for (int i = 0; i < NUM_LEDS; i++) {
-                Serial.print(ledStates[i] ? "1" : "0");
+        }
+        else if (command == "froth_off") {
+            turnOffDevice("frother");
+        }
+        else if (command == "froth_battery") {
+            String battery = getDeviceBattery("frother");
+            if (pStatusChar) {
+                String msg = "Battery: " + battery + "%";
+                pStatusChar->setValue(msg.c_str());
+                pStatusChar->notify();
             }
-            Serial.println();
+        }
+        else if (command == "list_devices") {
+            listDevices();
         }
     }
 };
+
+class LedControlCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pCharacteristic) {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() == 0) return;
+        
+        uint8_t ledByte = value[0];
+        appControlsLeds = true;
+        lastAppLedUpdate = millis();
+        
+        strip.ClearTo(RgbwColor(0, 0, 0, 0));
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (ledByte & (1 << i)) {
+                strip.SetPixelColor(i, RgbwColor(0, 136, 255, 0));
+            }
+        }
+        strip.Show();
+    }
+};
+
+// ============================================================================
+// DEVICE SCANNING
+// ============================================================================
+
+class SovenDeviceScanCallbacks: public NimBLEAdvertisedDeviceCallbacks {
+    void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+        // Debug: Print every device we see
+        Serial.print("📡 Saw: ");
+        Serial.print(advertisedDevice->getName().c_str());
+        Serial.print(" | ");
+        Serial.println(advertisedDevice->getAddress().toString().c_str());
+        
+        if (advertisedDevice->haveServiceUUID()) {
+            Serial.print("   Services: ");
+            for (int i = 0; i < advertisedDevice->getServiceUUIDCount(); i++) {
+                Serial.print(advertisedDevice->getServiceUUID(i).toString().c_str());
+                Serial.print(" ");
+            }
+            Serial.println();
+            
+            if (advertisedDevice->isAdvertisingService(NimBLEUUID(Soven::SERVICE_UUID))) {
+                Serial.println("   ✓ MATCH! Adding to registry");
+                registry.addDevice(advertisedDevice);
+            } else {
+                Serial.println("   ✗ Not a Soven device");
+            }
+        } else {
+            Serial.println("   (No service UUIDs)");
+        }
+    }
+};
+
+// ============================================================================
+// SERIAL COMMANDS
+// ============================================================================
+
+void handleSerialCommands() {
+    if (!Serial.available()) return;
+    
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) return;
+    
+    if (input == "scan") {
+        Serial.println("📡 Scanning...");
+        pBLEScan->start(5, false);
+    }
+    else if (input == "devices") {
+        listDevices();
+    }
+    else if (input == "froth on") {
+        turnOnDevice("frother", "30");
+    }
+    else if (input.startsWith("froth on ")) {
+        turnOnDevice("frother", input.substring(9));
+    }
+    else if (input == "froth off") {
+        turnOffDevice("frother");
+    }
+    else if (input == "froth battery") {
+        Serial.println("Battery: " + getDeviceBattery("frother") + "%");
+    }
+    else if (input == "brew") {
+        brewStartTime = millis();
+        transitionToState(BREWING);
+    }
+    else if (input == "stop") {
+        transitionToState(IDLE);
+    }
+    else if (input == "help") {
+        Serial.println("\n=== Commands ===");
+        Serial.println("brew / stop");
+        Serial.println("scan / devices");
+        Serial.println("froth on [duration]");
+        Serial.println("froth off / froth battery");
+        Serial.println("===============\n");
+    }
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("Soven Coffee Maker starting...");
+    Serial.println("\n╔════════════════════════════════════╗");
+    Serial.println("║  SOVEN HUB - ALL NIMBLE v2.0      ║");
+    Serial.println("╚════════════════════════════════════╝\n");
     
-    //Factory Reset
-    //preferences.begin("soven", false);
-    //preferences.remove("ai_name");
-    //preferences.end();
-    //Serial.println(">>> FACTORY RESET: Name cleared");
-
-    // Initialize pins
     pinMode(RELAY_PIN, OUTPUT);
     digitalWrite(RELAY_PIN, LOW);
     pinMode(TEMP_SENSOR_PIN, INPUT);
     
-    // Initialize NeoPixelBus - simple startup
     strip.Begin();
     strip.Show();
     
-    Serial.println("Hardware initialized");
-    
-    // Get unique serial from MAC address
+    // Get device serial
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char serialStr[7];
     sprintf(serialStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
     deviceSerial = String(serialStr);
     
-    // Check if device has been registered (has custom name)
+    // Check for custom name
     preferences.begin("soven", false);
     String aiName = preferences.getString("ai_name", "");
     preferences.end();
     
-    // Broadcast format: "Soven-Coffee-SERIAL" or custom name if registered
-    if (aiName.length() > 0) {
-        broadcastName = aiName;
-    } else {
-        broadcastName = "Soven-Coffee-" + deviceSerial;
-    }
-    
-    Serial.print("Broadcasting as: ");
-    Serial.println(broadcastName);
+    broadcastName = (aiName.length() > 0) ? aiName : "Soven-Coffee-" + deviceSerial;
+    Serial.println("Name: " + broadcastName);
 
-    // Initialize BLE
-    BLEDevice::init(broadcastName.c_str());
-    pServer = BLEDevice::createServer();
+    // Initialize NimBLE
+    NimBLEDevice::init(broadcastName.c_str());
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    
+    // Create server
+    pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
     
-    BLEService *pService = pServer->createService(SERVICE_UUID);
+    // Create service
+    NimBLEService *pService = pServer->createService(Soven::SERVICE_UUID);
     
-    pStateChar = pService->createCharacteristic(
-        STATE_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pStateChar->addDescriptor(new BLE2902());
-    pStateChar->setValue(stateToString(currentState));
-    
-    pTempChar = pService->createCharacteristic(
-        TEMP_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
-    );
-    pTempChar->addDescriptor(new BLE2902());
-       
+    // Universal characteristics
     pCommandChar = pService->createCharacteristic(
-        COMMAND_CHAR_UUID,
-        BLECharacteristic::PROPERTY_WRITE
+        Soven::COMMAND_UUID,
+        NIMBLE_PROPERTY::WRITE
     );
     pCommandChar->setCallbacks(new CommandCallbacks());
     
-    pConvoChar = pService->createCharacteristic(
-        CONVO_CHAR_UUID,
-        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    pStatusChar = pService->createCharacteristic(
+        Soven::STATUS_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
-    pConvoChar->addDescriptor(new BLE2902());
     
-    pLedStateChar = pService->createCharacteristic(
-        LED_STATE_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | 
-        BLECharacteristic::PROPERTY_WRITE | 
-        BLECharacteristic::PROPERTY_NOTIFY
+    // Hub-specific characteristics
+    pBrewStateChar = pService->createCharacteristic(
+        Soven::BREW_STATE_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
-    pLedStateChar->addDescriptor(new BLE2902());
-    pLedStateChar->setCallbacks(new LedStateCallbacks());
-
-    Serial.print("LED State characteristic created: ");
-    Serial.println(LED_STATE_CHAR_UUID);
-
+    pBrewStateChar->setValue(stateToString(currentState));
+    
+    pTempChar = pService->createCharacteristic(
+        Soven::TEMPERATURE_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+    );
+    
+    pLedControlChar = pService->createCharacteristic(
+        Soven::LED_CONTROL_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
+    );
+    pLedControlChar->setCallbacks(new LedControlCallbacks());
+    
+    pConvoChar = pService->createCharacteristic(
+        Soven::CONVERSATION_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY
+    );
+    
     pService->start();
 
-    // ADD MANUFACTURER DATA with serial (NimBLE style)
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-
-    // Create manufacturer data
-    std::string mfgData;
-    mfgData += (char)0xFF;  // Company ID low byte
-    mfgData += (char)0xFF;  // Company ID high byte
-    mfgData += (char)mac[3]; // Serial byte 1
-    mfgData += (char)mac[4]; // Serial byte 2
-    mfgData += (char)mac[5]; // Serial byte 3
-
-    // Get advertisement data object and set manufacturer data
-    BLEAdvertisementData advData;
-    advData.setManufacturerData(mfgData);
-    pAdvertising->setAdvertisementData(advData);
-
-    // Continue with existing advertising setup
-    pAdvertising->addServiceUUID(SERVICE_UUID);
+    // Start advertising
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(Soven::SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMaxPreferred(0x12);
-    BLEDevice::startAdvertising();
+    pAdvertising->start();
+    
+    Serial.println("✓ BLE server started");
 
-    Serial.print("Serial in manufacturer data: ");
-    Serial.println(deviceSerial);
-    Serial.println("BLE service started, advertising...");
-    Serial.println("Ready to brew!");
-    }
+    // Initialize scanner
+    Serial.println("🔍 Initializing scanner...");
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new SovenDeviceScanCallbacks());
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+    
+    Serial.println("📡 Scanning for devices...");
+    pBLEScan->start(5, false);
+    
+    Serial.println("\n✓ Ready\n");
+}
+
+// ============================================================================
+// LOOP
+// ============================================================================
 
 void loop() {
+    handleSerialCommands();
+    
+    if (!isScanning && (millis() - lastDeviceScan >= DEVICE_SCAN_INTERVAL)) {
+        isScanning = true;
+        pBLEScan->start(3, false);
+        registry.removeStaleDevices();
+        lastDeviceScan = millis();
+    }
+    
     updateStateMachine();
-    delay(50);  // 20Hz update rate
+    delay(50);
 }
